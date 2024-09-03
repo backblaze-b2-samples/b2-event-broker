@@ -1,5 +1,5 @@
 {
-  "name": "event-multiplexer",
+  "name": "event-broker",
   "version": "0.0.0",
   "private": true,
   "scripts": {
@@ -8,6 +8,9 @@
     "start": "wrangler dev"
   },
   "devDependencies": {
-    "wrangler": "^3.60.3"
+    "wrangler": "^3.73.0"
+  },
+  "dependencies": {
+    "uuid": "^10.0.0"
   }
 }

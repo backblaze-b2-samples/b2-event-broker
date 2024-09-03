@@ -1,44 +1,290 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject } from 'cloudflare:workers';
+import { v4 as uuidv4 } from 'uuid';
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+import { createHmac } from 'node:crypto';
 
-/**
- * Env provides a mechanism to reference bindings declared in wrangler.toml within JavaScript
- *
- * @typedef {Object} Env
- * @property {DurableObjectNamespace} MY_DURABLE_OBJECT - The Durable Object namespace binding
- */
+const HTTP_STATUS_OK = 200;
+const HTTP_STATUS_BAD_REQUEST = 400;
+const HTTP_STATUS_UNAUTHORIZED = 401;
+const HTTP_STATUS_NOT_FOUND = 404;
+const HTTP_STATUS_METHOD_NOT_ALLOWED = 405;
+
+const EVENT_NOTIFICATION_SIGNATURE_HEADER = 'x-bz-event-notification-signature';
+
+class NotFoundError extends Error {
+	constructor(message) {
+		super(`NotFoundError: ${message}`);
+	}
+}
+
+class MethodNotAllowedError extends Error {
+	constructor(message) {
+		super(`MethodNotAllowedError: ${message}`);
+	}
+}
+
+function verifySignature(headers, body, signingSecret) {
+	if (headers.has(EVENT_NOTIFICATION_SIGNATURE_HEADER)) {
+		// Verify that signature has form "v1=2c8...231"
+		const signature = headers.get(EVENT_NOTIFICATION_SIGNATURE_HEADER);
+		const pair = signature.split('=');
+		if (!pair || pair.length !== 2) {
+			console.log(`Invalid signature format: ${signature}`);
+			return false;
+		}
+		const version = pair[0];
+		if (version !== 'v1') {
+			console.log(`Invalid signature version: ${version}`);
+			return false;
+		}
+
+		// Now calculate the HMAC and compare it with the one sent in the header
+		const receivedSig = pair[1];
+		const calculatedSig = createHmac('sha256', signingSecret)
+			.update(body)
+			.digest('hex');
+		if (receivedSig !== calculatedSig) {
+			console.log(`Invalid signature. Received ${receivedSig}; calculated ${calculatedSig}`);
+			return false;
+		}
+	} else {
+		console.log('Missing signature header');
+		return false;
+	}
+
+	// Success!
+	console.log('Signature is valid');
+	return true;
+}
+
+function checkUUID(id) {
+	const uuidRegExp = /^[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i;
+
+	if (!uuidRegExp.test(id)){
+		throw new Error(`Bad UUID: ${id}`);
+	}
+}
+
+function checkProperty(obj, objType, property, id) {
+	if (!Object.hasOwn(obj, property)) {
+		throw new Error(`Missing ${property} property in ${objType} object for ${id}`);
+	}
+}
 
 /** A Durable Object's behavior is defined in an exported Javascript class */
 export class MyDurableObject extends DurableObject {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param {DurableObjectState} ctx - The interface for interacting with Durable Object state
-	 * @param {Env} env - The interface to reference bindings declared in wrangler.toml
-	 */
 	constructor(ctx, env) {
 		super(ctx, env);
 	}
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param {string} name - The name provided to a Durable Object instance from a Worker
-	 * @returns {Promise<string>} The greeting to be sent back to the Worker
-	 */
-	async sayHello(name) {
-		return `Hello, ${name}!`;
+	async createSubscription(bucketName, ruleName, subscription) {
+		if (!subscription.url) {
+			throw new Error('No url in payload.');
+		}
+		if (!URL.canParse(subscription.url)) {
+			throw new Error('url in payload is not valid.');
+		}
+		const rules = (await this.ctx.storage.get(bucketName)) || {};
+		const subscriptions = rules[ruleName] || {};
+		const id = uuidv4();
+		subscriptions[id] = {
+			url: subscription.url,
+			failures: 0
+		};
+		rules[ruleName] = subscriptions;
+		await this.ctx.storage.put(bucketName, rules);
+		console.log('Created subscription:', bucketName, ruleName, id);
+		return { "id": id };
+	}
+
+	// One method to walk the parameters from the path, returning the appropriate data
+	async getSubscriptions(bucketName, ruleName, id) {
+		// GET /@subscriptions
+		if (!bucketName) {
+			console.log(`Returning rules for all buckets`);
+			// Convert Map to object so that it is JSON-serializable
+			return Object.fromEntries((await this.ctx.storage.list()) || []);
+		}
+
+		// GET /@subscriptions/mybucket
+		const rules = await this.ctx.storage.get(bucketName);
+		if (!rules) {
+			throw new NotFoundError(`No rules found for ${bucketName}`);
+		}
+		if (!ruleName) {
+			console.log(`Returning rules for ${bucketName}`);
+			return rules;
+		}
+
+		// GET /@subscriptions/mybucket/myRuleName
+		if (!Object.hasOwn(rules, ruleName)) {
+			throw new NotFoundError(`Rule ${ruleName} not found for ${bucketName}`);
+		}
+		const subscriptions = rules[ruleName];
+		if (!id) {
+			console.log(`Returning subscriptions for ${bucketName}/${ruleName}`);
+			return subscriptions;
+		}
+
+		// GET /@subscriptions/mybucket/myRuleName/2bdd4246-d838-4c0a-9a50-a7483534836e
+		if (!Object.hasOwn(subscriptions, id)) {
+			throw new NotFoundError(`ID ${id} not found for ${bucketName}/${ruleName}`);
+		}
+		console.log(`Returning subscription for ${bucketName}/${ruleName}/${id}`);
+		return subscriptions[id];
+	}
+
+	async setSubscriptions(bucketName, ruleName, subscriptions) {
+		for (const [id, subscription] of Object.entries(subscriptions)) {
+			checkUUID(id);
+			checkProperty(subscription, 'subscription', 'url', id);
+			checkProperty(subscription, 'subscription', 'failures', id);
+		}
+		const rules = await this.getSubscriptions(bucketName);
+		rules[ruleName] = subscriptions;
+		await this.ctx.storage.put(bucketName, rules);
+		console.log(`Updated subscriptions for ${bucketName}/${ruleName}`)
+	}
+
+	async deleteSubscription(bucketName, ruleName, id) {
+		const rules = await this.ctx.storage.get(bucketName);
+		if (!rules) {
+			throw new NotFoundError(`No subscriptions for ${ruleName}`);
+		}
+		if (Object.hasOwn(rules, ruleName)) {
+			const subscriptions = rules[ruleName];
+			if (Object.hasOwn(subscriptions, id)) {
+				let deleted = subscriptions[id];
+				delete subscriptions[id];
+				console.log(`Deleted subscription ${bucketName}/${ruleName}/${id}`);
+				if (Object.keys(subscriptions).length === 0) {
+					console.log(`No more subscriptions in ${bucketName}/${ruleName}`);
+					delete rules[ruleName];
+				}
+				if (Object.keys(rules).length > 0) {
+					console.log(`Updating rules for ${bucketName}/${ruleName}`);
+					await this.ctx.storage.put(bucketName, rules);
+				} else {
+					console.log(`No more rules in ${bucketName}`);
+					await this.ctx.storage.delete(bucketName);
+				}
+				return deleted;
+			} else {
+				throw new NotFoundError(`ID ${id} not found for ${bucketName}/${ruleName}`);
+			}
+		} else {
+			throw new NotFoundError(`Rule ${ruleName} not found for ${bucketName}`);
+		}
+	}
+}
+
+async function handleSubscriptionRequest(url, method, payload, stub) {
+	// pathname is of the form '/@subscriptions/mybucket/myRuleName/2bdd4246-d838-4c0a-9a50-a7483534836e'
+	// split returns an empty first element, since the pathname starts with the separator
+	const [_empty, resource, bucketName, ruleName, id] = url.pathname.split('/');
+
+	console.log(`Handling ${method} request for ${resource}/${bucketName}/${ruleName}/${id}`);
+
+	if (resource !== '@subscriptions') {
+		throw new NotFoundError(`Bad resource ${resource}`);
+	}
+
+	if (method === 'GET' || method === 'HEAD') {
+		// Can GET/HEAD any sub path - getSubscriptions figures it out
+		const result = await stub.getSubscriptions(bucketName, ruleName, id);
+		return (method === 'GET') ? result : null;
+	}
+
+	// POST and DELETE both require bucketName and ruleName, so if we're here without one of them, throw method error -
+	// you could GET that URL, but you can't POST/DELETE it.
+	if (!bucketName || !ruleName) {
+		throw new MethodNotAllowedError(`${method} not allowed for ${url}`);
+	}
+
+	let response;
+	switch (method) {
+		case 'POST':
+			if (!payload) {
+				throw new Error('Missing payload in POST request');
+			}
+			// Create a new subscription
+			response = await stub.createSubscription(bucketName, ruleName, payload);
+			break;
+		case 'DELETE':
+			if (!id) {
+				// Again, you could GET this URL, but you can't DELETE it
+				throw new MethodNotAllowedError(`${method} not allowed for ${url}`);
+			}
+			// Delete the subscription
+			response = await stub.deleteSubscription(bucketName, ruleName, id);
+			break;
+		default:
+			throw new MethodNotAllowedError(`${method} not allowed for ${url}`);
+	}
+
+	return response;
+}
+
+async function handleEventNotifications(events, env, stub) {
+	try {
+		console.log(`Handling batch of ${events.length} notifications`)
+
+		// TBD batch notifications back together
+		for (let event of events) {
+			const max_failure_count = parseInt(env.MAX_FAILURE_COUNT, 10);
+
+			const subscriptions = await stub.getSubscriptions(event.bucketName, event.matchedRuleName);
+
+			const sent = [];
+			const promises = [];
+			for (const [id, subscription] of Object.entries(subscriptions)) {
+				console.log(`POSTing to ${subscription.url}`);
+				promises.push(fetch(subscription.url, {
+					method: 'POST',
+					body: JSON.stringify({ "event": [event] })
+				}));
+				sent.push({ 'id': id, 'subscription': subscription });
+			}
+
+			if (promises.length === 0) {
+				console.log(`No subscribers to ${event.bucketName}/${event.matchedRuleName}`)
+			}
+
+			// true if we need to write subscription data back
+			let dirty = false;
+			const outcomes = await Promise.allSettled(promises);
+			for (let i = 0; i < outcomes.length; i++) {
+				const outcome = outcomes[i];
+				const { id, subscription } = sent[i];
+
+				if (outcome.status === 'fulfilled' && outcome.value.ok) {
+					console.log(`POST to ${subscription.url} succeeded with status ${outcome.value.status}`);
+					if (subscription.failures > 0) {
+						subscription.failures = 0;
+						dirty = true;
+					}
+				} else {
+					if (outcome.status === 'rejected') {
+						console.log(`POST to ${subscription.url} failed with reason ${outcome.reason}`);
+					} else {
+						console.log(`POST to ${subscription.url} failed with status ${outcome.value.status}, body ${await outcome.value.text()}`);
+					}
+					subscription.failures += 1;
+					console.log(`${subscription.failures} failures for ${event.bucketName}/${event.matchedRuleName}/${id}`)
+					if (subscription.failures >= max_failure_count) {
+						console.log(`Removing subscription ${id} of ${subscription.url} to ${event.matchedRuleName}`);
+						await stub.deleteSubscription(event.bucketName, event.matchedRuleName, id)
+					} else {
+						dirty = true;
+					}
+				}
+			}
+			if (dirty) {
+				await stub.setSubscriptions(event.bucketName, event.matchedRuleName, subscriptions);
+			}
+		}
+	} catch (e) {
+		console.error(e.stack);
 	}
 }
 
@@ -52,18 +298,58 @@ export default {
 	 * @returns {Promise<Response>} The response to be sent back to the client
 	 */
 	async fetch(request, env, ctx) {
-		// We will create a `DurableObjectId` using the pathname from the Worker request
-		// This id refers to a unique instance of our 'MyDurableObject' class above
-		let id = env.MY_DURABLE_OBJECT.idFromName(new URL(request.url).pathname);
+		const bodyText = await request.text();
 
-		// This stub creates a communication channel with the Durable Object instance
-		// The Durable Object constructor will be invoked upon the first call for a given id
-		let stub = env.MY_DURABLE_OBJECT.get(id);
+		if (!verifySignature(request.headers, bodyText, env.SIGNING_SECRET)){
+			return new Response(null, {status: HTTP_STATUS_UNAUTHORIZED});
+		}
 
-		// We call the `sayHello()` RPC method on the stub to invoke the method on the remote
-		// Durable Object instance
-		let greeting = await stub.sayHello("world");
+		let payload = null
+		if (request.method === 'POST' && bodyText.length > 0) {
+			try {
+				payload = JSON.parse(bodyText);
+			} catch (e) {
+				console.error(e.stack)
+				return new Response(null, {status: HTTP_STATUS_BAD_REQUEST});
+			}
+		}
 
-		return new Response(greeting);
+		// Use the Worker host as the durable object name
+		const url = new URL(request.url);
+		const object_id = env.MY_DURABLE_OBJECT.idFromName(url.host);
+		const stub = env.MY_DURABLE_OBJECT.get(object_id);
+
+		let response;
+		if (url.pathname.startsWith('/@')) {
+			// Control message
+			try {
+				let reply = await handleSubscriptionRequest(url, request.method, payload, stub);
+				console.log('reply:', reply);
+				response = reply ? Response.json(reply) : new Response(null, {status: HTTP_STATUS_OK});
+			} catch (e) {
+				let status = HTTP_STATUS_BAD_REQUEST;
+				if (e instanceof NotFoundError || (e.remote && e.message.startsWith('NotFoundError'))) {
+					status = HTTP_STATUS_NOT_FOUND;
+				} else if (e instanceof MethodNotAllowedError || (e.remote && e.message.startsWith('MethodNotAllowedError'))) {
+					status = HTTP_STATUS_NOT_FOUND;
+				}
+				response = new Response(e.message, { status: status });
+			}
+		} else {
+			// Event notification
+			if (request.method === 'POST') {
+				// We don't need to block while we send notifications to subscribers, since we send a 200 response no matter what.
+				// Use ctx.waitUntil to perform the notifications after the response is returned.
+				ctx.waitUntil(handleEventNotifications(payload.events, env, stub));
+
+				// Always respond 200 to B2 Event Notifications service
+				response = new Response(null, {status: HTTP_STATUS_OK});
+			} else {
+				// Only POST is allowed
+				response = new Response(null, {status: HTTP_STATUS_METHOD_NOT_ALLOWED});
+			}
+		}
+
+		return response;
 	},
 };
