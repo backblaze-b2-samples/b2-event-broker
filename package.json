@@ -1,6 +1,6 @@
 {
   "name": "event-broker",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "private": true,
   "scripts": {
     "deploy": "wrangler deploy",
@@ -8,7 +8,7 @@
     "start": "wrangler dev"
   },
   "devDependencies": {
-    "wrangler": "^3.73.0"
+    "wrangler": "^3.74.0"
   },
   "dependencies": {
     "uuid": "^10.0.0"
