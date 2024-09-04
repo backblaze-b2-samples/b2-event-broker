@@ -88,8 +88,7 @@ export class MyDurableObject extends DurableObject {
 		const subscriptions = rules[ruleName] || {};
 		const id = uuidv4();
 		subscriptions[id] = {
-			url: subscription.url,
-			failures: 0
+			url: subscription.url
 		};
 		rules[ruleName] = subscriptions;
 		await this.ctx.storage.put(bucketName, rules);
@@ -138,9 +137,8 @@ export class MyDurableObject extends DurableObject {
 		for (const [id, subscription] of Object.entries(subscriptions)) {
 			checkUUID(id);
 			checkProperty(subscription, 'subscription', 'url', id);
-			checkProperty(subscription, 'subscription', 'failures', id);
 		}
-		const rules = await this.getSubscriptions(bucketName);
+		const rules = await this.ctx.storage.get(bucketName);
 		rules[ruleName] = subscriptions;
 		await this.ctx.storage.put(bucketName, rules);
 		console.log(`Updated subscriptions for ${bucketName}/${ruleName}`)
@@ -225,62 +223,84 @@ async function handleSubscriptionRequest(url, method, payload, stub) {
 	return response;
 }
 
+function sleep(ms) {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(resource, options, maxFailureCount) {
+	// Delay will be 0, 1, 2, 4, etc. (in seconds)
+	let delay = 0;
+
+	for (let i = 0; i < maxFailureCount; i++) {
+		let response = null, reason = null;
+		try {
+			response = await fetch(resource, options);
+		} catch (e) {
+			reason = e;
+		}
+
+		if (response?.ok) {
+			console.log(`POST to ${resource} succeeded with status ${response.status}`);
+			return response;
+		} else {
+			if (response) {
+				console.log(`POST to ${resource} failed with status ${response.status}, body ${await response.text()}`);
+			} else {
+				console.log(`POST to ${resource} failed: ${reason}`);
+			}
+
+			await sleep(delay);
+			delay = (delay === 0) ? 1000 : delay * 2;
+		}
+	}
+
+	throw new Error(`${maxFailureCount} failures to ${options.method} ${resource}`);
+}
+
 async function handleEventNotifications(events, env, stub) {
+	const maxFailureCount = parseInt(env.MAX_FAILURE_COUNT, 10);
+
 	try {
 		console.log(`Handling batch of ${events.length} notifications`)
 
 		// TBD batch notifications back together
 		for (let event of events) {
-			const max_failure_count = parseInt(env.MAX_FAILURE_COUNT, 10);
-
-			const subscriptions = await stub.getSubscriptions(event.bucketName, event.matchedRuleName);
-
-			const sent = [];
-			const promises = [];
-			for (const [id, subscription] of Object.entries(subscriptions)) {
-				console.log(`POSTing to ${subscription.url}`);
-				promises.push(fetch(subscription.url, {
-					method: 'POST',
-					body: JSON.stringify({ "event": [event] })
-				}));
-				sent.push({ 'id': id, 'subscription': subscription });
+			let subscriptions = null;
+			try {
+				subscriptions = await stub.getSubscriptions(event.bucketName, event.matchedRuleName);
+			} catch (e) {
+				if (e instanceof NotFoundError || (e.remote && e.message.startsWith('NotFoundError'))) {
+					subscriptions = [];
+				} else {
+					console.log(`Error getting subscriptions: {e}`);
+					return;
+				}
 			}
 
-			if (promises.length === 0) {
+			if (Object.entries(subscriptions).length === 0) {
 				console.log(`No subscribers to ${event.bucketName}/${event.matchedRuleName}`)
 			}
 
-			// true if we need to write subscription data back
-			let dirty = false;
+			const promises = [], sent = [];
+			for (const [id, subscription] of Object.entries(subscriptions)) {
+				console.log(`POSTing to ${subscription.url}`);
+				promises.push(fetchWithRetry(subscription.url, {
+					method: 'POST',
+					body: JSON.stringify({ "event": [event] })
+				}, maxFailureCount));
+				sent.push({ 'id': id, 'subscription': subscription });
+			}
+
 			const outcomes = await Promise.allSettled(promises);
 			for (let i = 0; i < outcomes.length; i++) {
 				const outcome = outcomes[i];
 				const { id, subscription } = sent[i];
 
-				if (outcome.status === 'fulfilled' && outcome.value.ok) {
-					console.log(`POST to ${subscription.url} succeeded with status ${outcome.value.status}`);
-					if (subscription.failures > 0) {
-						subscription.failures = 0;
-						dirty = true;
-					}
-				} else {
-					if (outcome.status === 'rejected') {
-						console.log(`POST to ${subscription.url} failed with reason ${outcome.reason}`);
-					} else {
-						console.log(`POST to ${subscription.url} failed with status ${outcome.value.status}, body ${await outcome.value.text()}`);
-					}
-					subscription.failures += 1;
-					console.log(`${subscription.failures} failures for ${event.bucketName}/${event.matchedRuleName}/${id}`)
-					if (subscription.failures >= max_failure_count) {
-						console.log(`Removing subscription ${id} of ${subscription.url} to ${event.matchedRuleName}`);
-						await stub.deleteSubscription(event.bucketName, event.matchedRuleName, id)
-					} else {
-						dirty = true;
-					}
+				if (outcome.status === 'rejected') {
+					console.log(outcome.reason);
+					console.log(`Removing subscription ${id} of ${subscription.url} to ${event.matchedRuleName}`);
+					await stub.deleteSubscription(event.bucketName, event.matchedRuleName, id)
 				}
-			}
-			if (dirty) {
-				await stub.setSubscriptions(event.bucketName, event.matchedRuleName, subscriptions);
 			}
 		}
 	} catch (e) {
