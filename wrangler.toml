@@ -9,9 +9,9 @@ compatibility_flags = [ "nodejs_compat" ]
 MAX_FAILURE_COUNT = "5"
 
 [[durable_objects.bindings]]
-name = "MY_DURABLE_OBJECT"
-class_name = "MyDurableObject"
+name = "EVENT_SUBSCRIPTIONS"
+class_name = "EventSubscriptions"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["MyDurableObject"]
+new_classes = ["EventSubscriptions"]

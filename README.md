@@ -10,23 +10,82 @@ The event broker is designed to receive event notification messages from Backbla
 
 The event broker validates that incoming event notifications are signed with the shared secret, then responds to Backblaze B2 with a 200 HTTP status code and empty payload before forwarding the event notification(s) to subscribers.
 
+## Prerequisites
+
+* A [Cloudflare account](https://dash.cloudflare.com/sign-up/workers).
+* [npm](https://docs.npmjs.com/getting-started).
+* [Node.js](https://nodejs.org/en/) version 16.17.0 or later.
+* [Wrangler](https://developers.cloudflare.com/workers/wrangler/install-and-update/).
+
+## Deployment
+
+Clone this repository to your machine and `cd` into the repository directory:
+
+```console
+% git clone git@github.com:backblaze-b2-samples/b2-event-broker.git
+Cloning into 'b2-event-broker'...
+...
+% cd b2-event-broker
+```
+
+Install dependencies:
+
+```console
+% npm install
+...
+added 82 packages, and audited 83 packages in 3s
+...
+```
+
+Edit the worker name in `wrangler.toml` if you wish.
+
+Deploy the worker to your Cloudflare account:
+
+```console
+% npx wrangler deploy
+
+ ⛅️ wrangler 3.73.0
+-------------------------------------------------------
+
+Total Upload: 13.00 KiB / gzip: 3.57 KiB
+Worker Startup Time: 16 ms
+Your worker has access to the following bindings:
+- Durable Objects:
+  - EVENT_SUBSCRIPTIONS: EventSubscriptions
+- Vars:
+  - MAX_FAILURE_COUNT: "5"
+Uploaded event-broker (1.90 sec)
+Deployed event-broker triggers (3.54 sec)
+  https://event-broker.acme.workers.dev
+Current Version ID: 01f24f1b-9e03-466e-aebb-530636b9748f
+```
+
+Configure a Cloudflare Secret named `SIGNING_SECRET` with the shared secret from your event notification rule(s). Wrangler will prompt you to enter the value:
+
+```console
+% npx wrangler secret put SIGNING_SECRET
+
+ ⛅️ wrangler 3.73.0 (update available 3.74.0)
+-------------------------------------------------------
+
+✔ Enter a secret value: … ********************************
+🌀 Creating the secret for the Worker "event-broker-test"
+✨ Success! Uploaded secret SIGNING_SECRET
+```
+
+The `wrangler.toml` file includes a variable, `MAX_FAILURE_COUNT`, set to 5 by default, that controls the number of delivery attempts that the event broker will make for an event notification before automatically removing a subscription. The first retry is immediate, the second after 1 second, the third after 2 seconds, the fourth after 4 seconds, and so on.
+
 ## Subscriptions
 
 Subscriptions are resources with URL paths of the form `/@subscriptions/{bucket-name}/{rule-name}/{id}` and content of the form:
 
 ```json
 {
-	"url": "https://example.com/listener"
+    "url": "https://example.com/listener"
 }
 ```
 
 ALL incoming requests, both subscription requests and event notifications, must be signed using a shared secret. The shared secret is the same as the shared secret in your event notification rule(s), and is configured as a [Cloudflare Secret](https://developers.cloudflare.com/workers/configuration/secrets/) so that the event broker can validate the signature.
-
-### Configuration
-
-Before deploying the worker, you must [configure a Cloudflare Secret](https://developers.cloudflare.com/workers/configuration/secrets/#secrets-on-deployed-workers) named `SIGNING_SECRET` with the shared secret from your event notification rule(s).
-
-The `wrangler.toml` file includes a variable, `MAX_FAILURE_COUNT`, that controls the number of delivery attempts that the event broker will make for an event notification before automatically removing a subscription. The first retry is immediate, the second after 1 second, the third after 2 seconds, the fourth after 4 seconds, and so on.
 
 ### Create a Subscription
 

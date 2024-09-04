@@ -8,8 +8,11 @@ const HTTP_STATUS_BAD_REQUEST = 400;
 const HTTP_STATUS_UNAUTHORIZED = 401;
 const HTTP_STATUS_NOT_FOUND = 404;
 const HTTP_STATUS_METHOD_NOT_ALLOWED = 405;
+const HTTP_STATUS_INTERNAL_SERVER_ERROR = 500;
 
 const EVENT_NOTIFICATION_SIGNATURE_HEADER = 'x-bz-event-notification-signature';
+
+const DEFAULT_MAX_FAILURE_COUNT = 5;
 
 class NotFoundError extends Error {
 	constructor(message) {
@@ -72,7 +75,7 @@ function checkProperty(obj, objType, property, id) {
 }
 
 /** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject {
+export class EventSubscriptions extends DurableObject {
 	constructor(ctx, env) {
 		super(ctx, env);
 	}
@@ -258,7 +261,9 @@ async function fetchWithRetry(resource, options, maxFailureCount) {
 }
 
 async function handleEventNotifications(events, env, stub) {
-	const maxFailureCount = parseInt(env.MAX_FAILURE_COUNT, 10);
+	const maxFailureCount = Object.hasOwn(env, 'MAX_FAILURE_COUNT')
+		? parseInt(env.MAX_FAILURE_COUNT, 10)
+		: DEFAULT_MAX_FAILURE_COUNT;
 
 	try {
 		console.log(`Handling batch of ${events.length} notifications`)
@@ -318,6 +323,11 @@ export default {
 	 * @returns {Promise<Response>} The response to be sent back to the client
 	 */
 	async fetch(request, env, ctx) {
+		if (!Object.hasOwn(env, 'SIGNING_SECRET')) {
+			console.log('You must set SIGNING_SECRET as a Cloudflare Secret');
+			return new Response(null, {status: HTTP_STATUS_INTERNAL_SERVER_ERROR});
+		}
+
 		const bodyText = await request.text();
 
 		if (!verifySignature(request.headers, bodyText, env.SIGNING_SECRET)){
@@ -336,8 +346,8 @@ export default {
 
 		// Use the Worker host as the durable object name
 		const url = new URL(request.url);
-		const object_id = env.MY_DURABLE_OBJECT.idFromName(url.host);
-		const stub = env.MY_DURABLE_OBJECT.get(object_id);
+		const object_id = env.EVENT_SUBSCRIPTIONS.idFromName(url.host);
+		const stub = env.EVENT_SUBSCRIPTIONS.get(object_id);
 
 		let response;
 		if (url.pathname.startsWith('/@')) {
