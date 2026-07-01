@@ -8,7 +8,7 @@
     "start": "wrangler dev"
   },
   "devDependencies": {
-    "wrangler": "^3.74.0"
+    "wrangler": "^4.106.0"
   },
   "dependencies": {
     "uuid": "^10.0.0"
