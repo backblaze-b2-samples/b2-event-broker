@@ -2,10 +2,12 @@
   "name": "event-broker",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "start": "wrangler dev"
+    "start": "wrangler dev",
+    "test": "node --test"
   },
   "devDependencies": {
     "wrangler": "^3.74.0"

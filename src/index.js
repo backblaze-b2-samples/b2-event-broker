@@ -1,7 +1,12 @@
 import { DurableObject } from 'cloudflare:workers';
 import { v4 as uuidv4 } from 'uuid';
 
-import { createHmac } from 'node:crypto';
+import {
+	buildControlSignaturePayload,
+	normalizeSubscription,
+	normalizeSubscriptions,
+	verifySignature
+} from './security.js';
 
 const HTTP_STATUS_OK = 200;
 const HTTP_STATUS_BAD_REQUEST = 400;
@@ -9,8 +14,6 @@ const HTTP_STATUS_UNAUTHORIZED = 401;
 const HTTP_STATUS_NOT_FOUND = 404;
 const HTTP_STATUS_METHOD_NOT_ALLOWED = 405;
 const HTTP_STATUS_INTERNAL_SERVER_ERROR = 500;
-
-const EVENT_NOTIFICATION_SIGNATURE_HEADER = 'x-bz-event-notification-signature';
 
 const DEFAULT_MAX_FAILURE_COUNT = 5;
 
@@ -26,71 +29,6 @@ class MethodNotAllowedError extends Error {
 	}
 }
 
-function verifySignature(headers, body, signingSecret) {
-	if (headers.has(EVENT_NOTIFICATION_SIGNATURE_HEADER)) {
-		// Verify that signature has form "v1=2c8...231"
-		const signature = headers.get(EVENT_NOTIFICATION_SIGNATURE_HEADER);
-		const pair = signature.split('=');
-		if (!pair || pair.length !== 2) {
-			console.log(`Invalid signature format: ${signature}`);
-			return false;
-		}
-		const version = pair[0];
-		if (version !== 'v1') {
-			console.log(`Invalid signature version: ${version}`);
-			return false;
-		}
-
-		// Now calculate the HMAC and compare it with the one sent in the header
-		const receivedSig = pair[1];
-		const calculatedSig = createHmac('sha256', signingSecret)
-			.update(body)
-			.digest('hex');
-		if (receivedSig !== calculatedSig) {
-			console.log(`Invalid signature. Received ${receivedSig}; calculated ${calculatedSig}`);
-			return false;
-		}
-	} else {
-		console.log('Missing signature header');
-		return false;
-	}
-
-	// Success!
-	console.log('Signature is valid');
-	return true;
-}
-
-function checkUUID(id) {
-	const uuidRegExp = /^[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i;
-
-	if (!uuidRegExp.test(id)){
-		throw new Error(`Bad UUID: ${id}`);
-	}
-}
-
-function checkProperty(obj, objType, property, id) {
-	if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
-		throw new Error(`Bad ${objType} object for ${id}`);
-	}
-	if (!Object.hasOwn(obj, property)) {
-		throw new Error(`Missing ${property} property in ${objType} object for ${id}`);
-	}
-}
-
-function checkSubscriptions(subscriptions) {
-	if (!subscriptions || typeof subscriptions !== 'object' || Array.isArray(subscriptions)) {
-		throw new Error('Subscriptions payload must be an object');
-	}
-
-	for (const [id, subscription] of Object.entries(subscriptions)) {
-		checkUUID(id);
-		checkProperty(subscription, 'subscription', 'url', id);
-		if (!URL.canParse(subscription.url)) {
-			throw new Error(`Bad url in subscription object for ${id}`);
-		}
-	}
-}
-
 /** A Durable Object's behavior is defined in an exported Javascript class */
 export class EventSubscriptions extends DurableObject {
 	constructor(ctx, env) {
@@ -98,18 +36,11 @@ export class EventSubscriptions extends DurableObject {
 	}
 
 	async createSubscription(bucketName, ruleName, subscription) {
-		if (!subscription.url) {
-			throw new Error('No url in payload.');
-		}
-		if (!URL.canParse(subscription.url)) {
-			throw new Error('url in payload is not valid.');
-		}
+		const normalizedSubscription = normalizeSubscription(subscription);
 		const rules = (await this.ctx.storage.get(bucketName)) || {};
 		const subscriptions = rules[ruleName] || {};
 		const id = uuidv4();
-		subscriptions[id] = {
-			url: subscription.url
-		};
+		subscriptions[id] = normalizedSubscription;
 		rules[ruleName] = subscriptions;
 		await this.ctx.storage.put(bucketName, rules);
 		console.log('Created subscription:', bucketName, ruleName, id);
@@ -154,9 +85,9 @@ export class EventSubscriptions extends DurableObject {
 	}
 
 	async setSubscriptions(bucketName, ruleName, subscriptions) {
-		checkSubscriptions(subscriptions);
+		const normalizedSubscriptions = normalizeSubscriptions(subscriptions);
 		const rules = (await this.ctx.storage.get(bucketName)) || {};
-		rules[ruleName] = subscriptions;
+		rules[ruleName] = normalizedSubscriptions;
 		await this.ctx.storage.put(bucketName, rules);
 		console.log(`Updated subscriptions for ${bucketName}/${ruleName}`)
 	}
@@ -225,6 +156,13 @@ async function handleSubscriptionRequest(url, method, payload, stub) {
 			// Create a new subscription
 			response = await stub.createSubscription(bucketName, ruleName, payload);
 			break;
+		case 'PUT':
+			if (!payload) {
+				throw new Error('Missing payload in PUT request');
+			}
+			// Replace the subscriptions for this bucket/rule
+			response = await stub.setSubscriptions(bucketName, ruleName, payload);
+			break;
 		case 'DELETE':
 			if (!id) {
 				// Again, you could GET this URL, but you can't DELETE it
@@ -242,6 +180,43 @@ async function handleSubscriptionRequest(url, method, payload, stub) {
 
 function sleep(ms) {
 	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isNotFoundError(e) {
+	return e instanceof NotFoundError
+		|| (e.remote && e.message?.startsWith('NotFoundError'));
+}
+
+function formatError(e) {
+	return e?.stack || String(e);
+}
+
+async function getSubscriptionDeliveryPlan(events, stub) {
+	const deliveryPlan = [];
+
+	for (let event of events) {
+		try {
+			deliveryPlan.push({
+				event,
+				subscriptions: await stub.getSubscriptions(event.bucketName, event.matchedRuleName)
+			});
+		} catch (e) {
+			if (isNotFoundError(e)) {
+				deliveryPlan.push({
+					event,
+					subscriptions: []
+				});
+			} else {
+				console.error(
+					`subscription_lookup_failed bucket=${event.bucketName} rule=${event.matchedRuleName}`,
+					formatError(e)
+				);
+				throw e;
+			}
+		}
+	}
+
+	return deliveryPlan;
 }
 
 async function fetchWithRetry(resource, options, maxFailureCount) {
@@ -274,28 +249,16 @@ async function fetchWithRetry(resource, options, maxFailureCount) {
 	throw new Error(`${maxFailureCount} failures to ${options.method} ${resource}`);
 }
 
-async function handleEventNotifications(events, env, stub) {
+async function handleEventNotifications(deliveryPlan, env, stub) {
 	const maxFailureCount = Object.hasOwn(env, 'MAX_FAILURE_COUNT')
 		? parseInt(env.MAX_FAILURE_COUNT, 10)
 		: DEFAULT_MAX_FAILURE_COUNT;
 
 	try {
-		console.log(`Handling batch of ${events.length} notifications`)
+		console.log(`Handling batch of ${deliveryPlan.length} notifications`)
 
 		// TBD batch notifications back together
-		for (let event of events) {
-			let subscriptions = null;
-			try {
-				subscriptions = await stub.getSubscriptions(event.bucketName, event.matchedRuleName);
-			} catch (e) {
-				if (e instanceof NotFoundError || (e.remote && e.message.startsWith('NotFoundError'))) {
-					subscriptions = [];
-				} else {
-					console.log(`Error getting subscriptions: ${e}`);
-					return;
-				}
-			}
-
+		for (let { event, subscriptions } of deliveryPlan) {
 			if (Object.entries(subscriptions).length === 0) {
 				console.log(`No subscribers to ${event.bucketName}/${event.matchedRuleName}`)
 			}
@@ -343,13 +306,18 @@ export default {
 		}
 
 		const bodyText = await request.text();
+		const url = new URL(request.url);
+		const isControlRequest = url.pathname.startsWith('/@');
+		const signedContent = isControlRequest
+			? buildControlSignaturePayload(request.method, url, bodyText)
+			: bodyText;
 
-		if (!verifySignature(request.headers, bodyText, env.SIGNING_SECRET)){
+		if (!verifySignature(request.headers, signedContent, env.SIGNING_SECRET)){
 			return new Response(null, {status: HTTP_STATUS_UNAUTHORIZED});
 		}
 
 		let payload = null
-		if (request.method === 'POST' && bodyText.length > 0) {
+		if ((request.method === 'POST' || request.method === 'PUT') && bodyText.length > 0) {
 			try {
 				payload = JSON.parse(bodyText);
 			} catch (e) {
@@ -359,12 +327,11 @@ export default {
 		}
 
 		// Use the Worker host as the durable object name
-		const url = new URL(request.url);
 		const object_id = env.EVENT_SUBSCRIPTIONS.idFromName(url.host);
 		const stub = env.EVENT_SUBSCRIPTIONS.get(object_id);
 
 		let response;
-		if (url.pathname.startsWith('/@')) {
+		if (isControlRequest) {
 			// Control message
 			try {
 				let reply = await handleSubscriptionRequest(url, request.method, payload, stub);
@@ -372,9 +339,9 @@ export default {
 				response = reply ? Response.json(reply) : new Response(null, {status: HTTP_STATUS_OK});
 			} catch (e) {
 				let status = HTTP_STATUS_BAD_REQUEST;
-				if (e instanceof NotFoundError || (e.remote && e.message.startsWith('NotFoundError'))) {
+				if (e instanceof NotFoundError || (e.remote && e.message?.startsWith('NotFoundError'))) {
 					status = HTTP_STATUS_NOT_FOUND;
-				} else if (e instanceof MethodNotAllowedError || (e.remote && e.message.startsWith('MethodNotAllowedError'))) {
+				} else if (e instanceof MethodNotAllowedError || (e.remote && e.message?.startsWith('MethodNotAllowedError'))) {
 					status = HTTP_STATUS_METHOD_NOT_ALLOWED;
 				}
 				response = new Response(e.message, { status: status });
@@ -382,9 +349,16 @@ export default {
 		} else {
 			// Event notification
 			if (request.method === 'POST') {
+				let deliveryPlan;
+				try {
+					deliveryPlan = await getSubscriptionDeliveryPlan(payload.events, stub);
+				} catch {
+					return new Response(null, {status: HTTP_STATUS_INTERNAL_SERVER_ERROR});
+				}
+
 				// We don't need to block while we send notifications to subscribers, since we send a 200 response no matter what.
 				// Use ctx.waitUntil to perform the notifications after the response is returned.
-				ctx.waitUntil(handleEventNotifications(payload.events, env, stub));
+				ctx.waitUntil(handleEventNotifications(deliveryPlan, env, stub));
 
 				// Always respond 200 to B2 Event Notifications service
 				response = new Response(null, {status: HTTP_STATUS_OK});
