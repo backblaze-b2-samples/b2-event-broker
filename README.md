@@ -8,7 +8,7 @@ The event broker is intended for use with [B2listen](https://github.com/backblaz
 
 The event broker is designed to receive event notification messages from Backblaze B2 and forward them to subscribers. All incoming HTTP POST requests that do not include the subscriptions path prefix, `/@subscriptions`, are treated as event notifications.
 
-The event broker validates that incoming event notifications are signed with the shared secret, then responds to Backblaze B2 with a 200 HTTP status code and empty payload before forwarding the event notification(s) to subscribers.
+The event broker validates that incoming event notifications are signed with the shared secret. Before acknowledging a batch, it reads the matching subscription records; if that lookup fails, it logs `subscription_lookup_failed` and returns 500 so Backblaze B2 can retry the notification. After subscription lookup succeeds, it responds with a 200 HTTP status code and empty payload before forwarding the event notification(s) to subscribers.
 
 ## Prerequisites
 
@@ -87,6 +87,19 @@ Subscriptions are resources with URL paths of the form `/@subscriptions/{bucket-
 
 ALL incoming requests, both subscription requests and event notifications, must be signed using a shared secret. The shared secret is the same as the shared secret in your event notification rule(s), and is configured as a [Cloudflare Secret](https://developers.cloudflare.com/workers/configuration/secrets/) so that the event broker can validate the signature.
 
+Event notification signatures are HMAC-SHA256 values over the request body. Subscription control requests use the same `x-bz-event-notification-signature` header, but the HMAC input is bound to the target resource:
+
+```text
+HTTP_METHOD
+URL_PATH
+URL_QUERY_STRING
+REQUEST_BODY
+```
+
+For example, a `POST /@subscriptions/my-bucket/my-rule` request with body `{ "url" : "https://example.com/listener" }` signs `POST\n/@subscriptions/my-bucket/my-rule\n\n{ "url" : "https://example.com/listener" }`. This prevents a signature captured for one bucket or rule from being replayed against another subscription resource.
+
+Subscription callback URLs must use `https` and must not target loopback, link-local, private, localhost, or `.local` hosts.
+
 ### Create a Subscription
 
 POST a JSON-formatted body containing the subscriber URL to a URL of the form `/@subscriptions/{bucket-name}/{rule-name}`. The event broker will respond with a JSON-formatted message containing the subscription ID. For example:
@@ -105,6 +118,18 @@ GET the subscription's URL to receive JSON-formatted subscription details:
 ```console
 % curl https://event-broker.acme.workers.dev/@subscriptions/metadaddy-tester/allEvents/ce986d9c-86f3-4fb4-99d6-366acbb133c9 -H 'x-bz-event-notification-signature: v1=329b6adc5eb23b4221ada77fe19751e30a92ba17c5518cb0d44ed00b5dbdb08c'
 {"url":"https://example.com/listener"}
+```
+
+### Replace Rule Subscriptions
+
+PUT a JSON object keyed by subscription ID to `/@subscriptions/{bucket-name}/{rule-name}` to replace the full subscription set for that bucket/rule. Each key must be a UUID and each value must contain a valid callback URL.
+
+```json
+{
+    "2bdd4246-d838-4c0a-9a50-a7483534836e": {
+        "url": "https://example.com/listener"
+    }
+}
 ```
 
 ### Delete a Subscription
