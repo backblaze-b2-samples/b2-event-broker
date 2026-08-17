@@ -14,7 +14,7 @@ The event broker validates that incoming event notifications are signed with the
 
 * A [Cloudflare account](https://dash.cloudflare.com/sign-up/workers).
 * [npm](https://docs.npmjs.com/getting-started).
-* [Node.js](https://nodejs.org/en/) version 16.17.0 or later.
+* [Node.js](https://nodejs.org/en/) version 22.0.0 or later.
 * [Wrangler](https://developers.cloudflare.com/workers/wrangler/install-and-update/).
 
 ## Deployment
