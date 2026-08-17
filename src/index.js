@@ -87,8 +87,10 @@ export class EventSubscriptions extends DurableObject {
 		if (!URL.canParse(subscription.url)) {
 			throw new Error('url in payload is not valid.');
 		}
-		const rules = (await this.ctx.storage.get(bucketName)) || {};
-		const subscriptions = rules[ruleName] || {};
+		const rules = (await this.ctx.storage.get(bucketName)) || Object.create(null);
+		const subscriptions = Object.hasOwn(rules, ruleName)
+			? rules[ruleName]
+			: Object.create(null);
 		const id = uuidv4();
 		subscriptions[id] = {
 			url: subscription.url
