@@ -69,6 +69,9 @@ function checkUUID(id) {
 }
 
 function checkProperty(obj, objType, property, id) {
+	if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+		throw new Error(`Invalid ${objType} object for ${id}`);
+	}
 	if (!Object.hasOwn(obj, property)) {
 		throw new Error(`Missing ${property} property in ${objType} object for ${id}`);
 	}
@@ -145,11 +148,18 @@ export class EventSubscriptions extends DurableObject {
 	}
 
 	async setSubscriptions(bucketName, ruleName, subscriptions) {
+		if (!subscriptions || typeof subscriptions !== 'object' || Array.isArray(subscriptions)) {
+			throw new Error('Subscriptions payload must be an object.');
+		}
 		for (const [id, subscription] of Object.entries(subscriptions)) {
 			checkUUID(id);
 			checkProperty(subscription, 'subscription', 'url', id);
+			if (!URL.canParse(subscription.url)) {
+				throw new Error(`url in subscription object for ${id} is not valid.`);
+			}
 		}
-		const rules = toPrototypeLessObject(await this.ctx.storage.get(bucketName));
+		const storedRules = await this.ctx.storage.get(bucketName);
+		const rules = storedRules ? toPrototypeLessObject(storedRules) : Object.create(null);
 		rules[ruleName] = toPrototypeLessObject(subscriptions);
 		await this.ctx.storage.put(bucketName, rules);
 		console.log(`Updated subscriptions for ${bucketName}/${ruleName}`)
@@ -285,7 +295,7 @@ async function handleEventNotifications(events, env, stub) {
 				if (e instanceof NotFoundError || (e.remote && e.message.startsWith('NotFoundError'))) {
 					subscriptions = [];
 				} else {
-					console.log(`Error getting subscriptions: {e}`);
+					console.error('Error getting subscriptions:', e);
 					return;
 				}
 			}
@@ -369,7 +379,7 @@ export default {
 				if (e instanceof NotFoundError || (e.remote && e.message.startsWith('NotFoundError'))) {
 					status = HTTP_STATUS_NOT_FOUND;
 				} else if (e instanceof MethodNotAllowedError || (e.remote && e.message.startsWith('MethodNotAllowedError'))) {
-					status = HTTP_STATUS_NOT_FOUND;
+					status = HTTP_STATUS_METHOD_NOT_ALLOWED;
 				}
 				response = new Response(e.message, { status: status });
 			}
