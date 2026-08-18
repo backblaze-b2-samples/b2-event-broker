@@ -74,6 +74,14 @@ function checkProperty(obj, objType, property, id) {
 	}
 }
 
+function toPrototypeLessObject(value) {
+	const object = Object.create(null);
+	if (value && typeof value === 'object' && !Array.isArray(value)) {
+		Object.assign(object, value);
+	}
+	return object;
+}
+
 /** A Durable Object's behavior is defined in an exported Javascript class */
 export class EventSubscriptions extends DurableObject {
 	constructor(ctx, env) {
@@ -87,8 +95,8 @@ export class EventSubscriptions extends DurableObject {
 		if (!URL.canParse(subscription.url)) {
 			throw new Error('url in payload is not valid.');
 		}
-		const rules = (await this.ctx.storage.get(bucketName)) || {};
-		const subscriptions = rules[ruleName] || {};
+		const rules = toPrototypeLessObject(await this.ctx.storage.get(bucketName));
+		const subscriptions = toPrototypeLessObject(rules[ruleName]);
 		const id = uuidv4();
 		subscriptions[id] = {
 			url: subscription.url
@@ -141,8 +149,8 @@ export class EventSubscriptions extends DurableObject {
 			checkUUID(id);
 			checkProperty(subscription, 'subscription', 'url', id);
 		}
-		const rules = await this.ctx.storage.get(bucketName);
-		rules[ruleName] = subscriptions;
+		const rules = toPrototypeLessObject(await this.ctx.storage.get(bucketName));
+		rules[ruleName] = toPrototypeLessObject(subscriptions);
 		await this.ctx.storage.put(bucketName, rules);
 		console.log(`Updated subscriptions for ${bucketName}/${ruleName}`)
 	}
